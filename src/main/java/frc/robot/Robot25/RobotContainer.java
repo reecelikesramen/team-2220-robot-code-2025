@@ -35,6 +35,7 @@ import edu.wpi.first.math.geometry.Rotation3d;
 import edu.wpi.first.math.geometry.Transform2d;
 import edu.wpi.first.math.geometry.Transform3d;
 import edu.wpi.first.math.geometry.Translation3d;
+import edu.wpi.first.math.kinematics.ChassisSpeeds;
 import edu.wpi.first.math.numbers.N3;
 import edu.wpi.first.wpilibj.GenericHID;
 import edu.wpi.first.wpilibj.XboxController;
@@ -328,7 +329,7 @@ public class RobotContainer extends frc.lib.RobotContainer {
     // drive.stopWithX();
   }
 
-  private Vector2 prevVelocity = Vector2.create(0, 0);
+  private ChassisSpeeds prevVelocity = new ChassisSpeeds();
   private double pitchVelocity = 0.0;
   private double pitch = 0.0;
 
@@ -340,12 +341,12 @@ public class RobotContainer extends frc.lib.RobotContainer {
     mechanismPoses[2] = elevatorPoses[2];
 
     /* Derives velocity from drive simulation velocity and DT */
-    var velocity = driveSimulation.getLinearVelocity().copy();
-    var dVelocity = velocity.difference(prevVelocity);
-    prevVelocity = velocity.copy();
-    var acceleration = dVelocity.divide(0.02);
-    Logger.recordOutput("AccelerationX", acceleration.x);
-    Logger.recordOutput("AccelerationY", acceleration.y);
+    var velocity = driveSimulation.getDriveTrainSimulatedChassisSpeedsRobotRelative();
+    var dVelocity = velocity.minus(prevVelocity);
+    prevVelocity = velocity;
+    var acceleration = dVelocity.div(0.02);
+    Logger.recordOutput("AccelerationX", acceleration.vxMetersPerSecond);
+    Logger.recordOutput("AccelerationY", acceleration.vyMetersPerSecond);
 
     /* Quadratic regression constants */
     final var a1 = 0.0010007;
@@ -391,7 +392,7 @@ public class RobotContainer extends frc.lib.RobotContainer {
     final var G = MetersPerSecondPerSecond.of(9.81);
     final var PITCH_MOI = 5.042; // I_yy; kg m^2
 
-    var externalTorque = M * -acceleration.x * zCoM.in(Meters);
+    var externalTorque = M * -acceleration.vxMetersPerSecond * zCoM.in(Meters);
     var pivotToCoMX = worldRobotCoM.relativeTo(robotPose3d.plus(toPitchPivot)).getMeasureX();
     Logger.recordOutput("PivotToCoMX", pivotToCoMX);
 
