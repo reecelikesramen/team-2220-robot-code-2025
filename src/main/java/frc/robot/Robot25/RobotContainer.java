@@ -332,6 +332,8 @@ public class RobotContainer extends frc.lib.RobotContainer {
   private ChassisSpeeds prevVelocity = new ChassisSpeeds();
   private double pitchVelocity = 0.0;
   private double pitch = 0.0;
+  private double rollVelocity = 0.0;
+  private double roll = 0.0;
 
   @Override
   public void simulationPeriodic() {
@@ -371,16 +373,26 @@ public class RobotContainer extends frc.lib.RobotContainer {
 
     // TODO +/- choose by direction
     var pitchPivot = new Translation3d(Inches.of(10.375), Inches.zero(), Inches.zero());
+    var rollPivot = new Translation3d(Inches.zero(), Inches.of(10.375), Inches.zero());
 
     if (pitch > 0 && pitch < Math.PI) {
       pitchPivot = pitchPivot.times(-1);
+    }
+
+    if (roll > Math.PI) {
+      rollPivot = rollPivot.times(-1);
     }
 
     var toPitchPivot = new Transform3d(pitchPivot.times(-1), Rotation3d.kZero);
     var pitchRotation = new Transform3d(Translation3d.kZero, new Rotation3d(0, pitch, 0));
     var fromPitchPivot = new Transform3d(pitchPivot, Rotation3d.kZero);
 
-    var worldRobotPose3d = robotPose3d.transformBy(toPitchPivot)
+    var toRollPivot = new Transform3d(rollPivot.times(-1), Rotation3d.kZero);
+    var rollRotation = new Transform3d(Translation3d.kZero, new Rotation3d(roll, 0, 0));
+    var fromRollPivot = new Transform3d(rollPivot, Rotation3d.kZero);
+
+    var worldRobotPose3d = robotPose3d.transformBy(toRollPivot)
+        .transformBy(rollRotation).transformBy(fromRollPivot).transformBy(toPitchPivot)
         .transformBy(pitchRotation).transformBy(fromPitchPivot);
     Logger.recordOutput("RobotPose3d", worldRobotPose3d);
 
@@ -390,35 +402,53 @@ public class RobotContainer extends frc.lib.RobotContainer {
 
     final var M = DriveConstants.ROBOT_MASS_KG;
     final var G = MetersPerSecondPerSecond.of(9.81);
-    final var PITCH_MOI = 5.042; // I_yy; kg m^2
+    final var PITCH_MOI = 5.044; // I_yy; kg m^2
+    final var ROLL_MOI = 5.29; // I_xx; kg m^2
 
-    var externalTorque = M * -acceleration.vxMetersPerSecond * zCoM.in(Meters);
-    var pivotToCoMX = worldRobotCoM.relativeTo(robotPose3d.plus(toPitchPivot)).getMeasureX();
-    Logger.recordOutput("PivotToCoMX", pivotToCoMX);
+    var pitchExternalTorque = M * -acceleration.vxMetersPerSecond * zCoM.in(Meters);
+    var pitchPivotToCoM = worldRobotCoM.relativeTo(robotPose3d.plus(toPitchPivot)).getMeasureX();
+    Logger.recordOutput("PitchPivotToCoM", pitchPivotToCoM);
+
+    var rollExternalTorque = M * acceleration.vyMetersPerSecond * zCoM.in(Meters);
+    var rollPivotToCoM = worldRobotCoM.relativeTo(robotPose3d.plus(toRollPivot)).getMeasureY().times(-1);
+    Logger.recordOutput("RollPivotToCoM", rollPivotToCoM);
 
     final var EQUILIBRIUM_THRESHOLD = Degrees.of(6).in(Radians) / 2;
     final var EFFECTIVE_PIVOT_SIGMOID_STEEPNESS = 5.0;
+    DoubleUnaryOperator effectivePivotSigmoidFn = theta -> 1
+        / (1 + Math.exp(-EFFECTIVE_PIVOT_SIGMOID_STEEPNESS * (theta / EQUILIBRIUM_THRESHOLD - 1)));
 
     var absPitch = pitch > Math.PI ? 2 * Math.PI - pitch : pitch;
-    var effectivePivotSigmoidScalar = 1
-        / (1 + Math.exp(-EFFECTIVE_PIVOT_SIGMOID_STEEPNESS * (absPitch / EQUILIBRIUM_THRESHOLD - 1)));
-    var effectivePivotToCoMX = effectivePivotSigmoidScalar * pivotToCoMX.in(Meters);
+    var pitchEffectivePivotToCoM = effectivePivotSigmoidFn.applyAsDouble(absPitch) * pitchPivotToCoM.in(Meters);
+    Logger.recordOutput("PitchEffectivePivotToCoMX", pitchEffectivePivotToCoM);
 
-    Logger.recordOutput("EffectivePivotToCoMX", effectivePivotToCoMX);
+    var absRoll = roll > Math.PI ? 2 * Math.PI - roll : roll;
+    var rollEffectivePivotToCoM = effectivePivotSigmoidFn.applyAsDouble(absRoll) * rollPivotToCoM.in(Meters);
+    Logger.recordOutput("RollEffectivePivotToCoMX", rollEffectivePivotToCoM);
 
     final var PITCH_VELOCITY_DAMPING = 0;
+    var pitchDampingTorque = -PITCH_VELOCITY_DAMPING * pitchVelocity;
+    var pitchGravityTorque = M * G.in(MetersPerSecondPerSecond) * pitchEffectivePivotToCoM;
+    var pitchTotalTorque = pitchGravityTorque + pitchExternalTorque + pitchDampingTorque;
+    Logger.recordOutput("PitchGravityTorque", pitchGravityTorque);
+    Logger.recordOutput("PitchExternalTorque", pitchExternalTorque);
 
-    var gravityTorque = M * G.in(MetersPerSecondPerSecond) * effectivePivotToCoMX;
-    var dampingTorque = -pitchVelocity * PITCH_VELOCITY_DAMPING;
-    var pitchTorque = gravityTorque + externalTorque + dampingTorque;
-    var pitchAccel = pitchTorque / PITCH_MOI;
+    final var ROLL_VELOCITY_DAMPING = 0;
+    var rollDampingTorque = -ROLL_VELOCITY_DAMPING * rollVelocity;
+    var rollGravityTorque = M * G.in(MetersPerSecondPerSecond) * rollEffectivePivotToCoM;
+    var rollTotalTorque = rollGravityTorque + rollExternalTorque + rollDampingTorque;
+    Logger.recordOutput("RollGravityTorque", rollGravityTorque);
+    Logger.recordOutput("RollExternalTorque", rollExternalTorque);
 
-    Logger.recordOutput("GravityTorque", gravityTorque);
-    Logger.recordOutput("ExternalTorque", externalTorque);
-
-    pitchVelocity += pitchAccel * 0.02;
+    var pitchAcceleration = pitchTotalTorque / PITCH_MOI;
+    pitchVelocity += pitchAcceleration * 0.02;
     pitch += pitchVelocity * 0.02;
     pitch = pitch % (2 * Math.PI);
+
+    var rollAcceleration = rollTotalTorque / ROLL_MOI;
+    rollVelocity += rollAcceleration * 0.02;
+    roll += rollVelocity * 0.02;
+    roll = roll % (2 * Math.PI);
 
     if (pitch < 0)
       pitch = pitch + 2 * Math.PI;
@@ -431,18 +461,36 @@ public class RobotContainer extends frc.lib.RobotContainer {
       pitchVelocity = 0;
     }
 
+    if (roll < 0)
+      roll = roll + 2 * Math.PI;
+
+    if (rollVelocity > 0 && roll > 0.5 * Math.PI && roll < Math.PI) {
+      roll = 0.5 * Math.PI;
+      rollVelocity = 0;
+    } else if (rollVelocity < 0 && roll < 1.5 * Math.PI && roll > Math.PI) {
+      roll = 1.5 * Math.PI;
+      rollVelocity = 0;
+    }
+
     final var GROUND_CONTACT_THRESHOLD = Degrees.of(7).in(Radians) / 2;
     final var GROUND_CONTACT_ENERGY_LOSS_SCALAR = 0.3;
     final var GROUND_CONTACT_SIGMOID_STEEPNESS = 8.0;
-    var groundContactSigmoidScalar = 1
-        / (1 + Math.exp(-GROUND_CONTACT_SIGMOID_STEEPNESS * (absPitch / GROUND_CONTACT_THRESHOLD - 1)));
+    DoubleUnaryOperator groundContactSigmoidScalarFn = theta -> 1
+        / (1 + Math.exp(-GROUND_CONTACT_SIGMOID_STEEPNESS * (theta / GROUND_CONTACT_THRESHOLD - 1)));
 
-    pitchVelocity *= groundContactSigmoidScalar * (1.0 -
+    pitchVelocity *= groundContactSigmoidScalarFn.applyAsDouble(absPitch) * (1.0 -
         GROUND_CONTACT_ENERGY_LOSS_SCALAR)
         + GROUND_CONTACT_ENERGY_LOSS_SCALAR;
 
-    Logger.recordOutput("PitchAcceleration", pitchAccel);
+    rollVelocity *= groundContactSigmoidScalarFn.applyAsDouble(absRoll) * (1.0 -
+        GROUND_CONTACT_ENERGY_LOSS_SCALAR)
+        + GROUND_CONTACT_ENERGY_LOSS_SCALAR;
+
+    Logger.recordOutput("PitchAcceleration", pitchAcceleration);
     Logger.recordOutput("PitchVelocity", pitchVelocity);
     Logger.recordOutput("Pitch", pitch);
+    Logger.recordOutput("RollAcceleration", rollAcceleration);
+    Logger.recordOutput("RollVelocity", rollVelocity);
+    Logger.recordOutput("Roll", roll);
   }
 }
