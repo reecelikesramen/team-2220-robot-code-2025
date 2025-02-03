@@ -13,8 +13,11 @@
 
 package frc.robot.Robot25;
 
+import static edu.wpi.first.units.Units.Degrees;
 import static edu.wpi.first.units.Units.Inches;
 import static edu.wpi.first.units.Units.Meters;
+import static edu.wpi.first.units.Units.MetersPerSecondPerSecond;
+import static edu.wpi.first.units.Units.Radians;
 import static edu.wpi.first.units.Units.Volt;
 
 import com.ctre.phoenix6.swerve.SwerveModuleConstants;
@@ -30,6 +33,7 @@ import edu.wpi.first.math.geometry.Pose3d;
 import edu.wpi.first.math.geometry.Rotation2d;
 import edu.wpi.first.math.geometry.Rotation3d;
 import edu.wpi.first.math.geometry.Transform2d;
+import edu.wpi.first.math.geometry.Transform3d;
 import edu.wpi.first.math.geometry.Translation3d;
 import edu.wpi.first.math.numbers.N3;
 import edu.wpi.first.wpilibj.GenericHID;
@@ -335,28 +339,7 @@ public class RobotContainer extends frc.lib.RobotContainer {
     mechanismPoses[1] = elevatorPoses[1];
     mechanismPoses[2] = elevatorPoses[2];
 
-    final var a1 = 0.0010007;
-    final var b1 = 0.101502;
-    final var c1 = 7.85883;
-    final var a2 = -0.0010289;
-    final var b2 = 0.229311;
-    final var c2 = 6.26015;
-
-    DoubleUnaryOperator estimateZCoM = h -> h < 0 ? 7.885
-        : h < 45 ? a1 * h * h + b1 * h + c1 : h < 75 ? a2 * h * h + b2 * h + c2 : 17.731;
-
-    var zCoM = estimateZCoM.applyAsDouble(elevator.getExtension());
-
-    var odometryToSimPosTransform = new Transform2d(Pose2d.kZero, SimConstants.SIM_INITIAL_FIELD_POSE);
-    var drivePose = drive.getPose().transformBy(odometryToSimPosTransform);
-
-    Logger.recordOutput("Robot CoM",
-        new Pose3d(new Translation3d(Inches.of(-1.793095).plus(drivePose.getMeasureX()),
-            Inches.of(0.824046).plus(drivePose.getMeasureY()), Inches.of(zCoM)), Rotation3d.kZero));
-
-    final var M = DriveConstants.ROBOT_MASS_KG;
-    final var PITCH_MOI = 5.042; // I_yy; kg m^2
-
+    /* Derives velocity from drive simulation velocity and DT */
     var velocity = driveSimulation.getLinearVelocity().copy();
     var dVelocity = velocity.difference(prevVelocity);
     prevVelocity = velocity.copy();
@@ -364,13 +347,98 @@ public class RobotContainer extends frc.lib.RobotContainer {
     Logger.recordOutput("AccelerationX", acceleration.x);
     Logger.recordOutput("AccelerationY", acceleration.y);
 
-    var pitchTorque = M * acceleration.x * Inches.of(zCoM).in(Meters);
+    /* Quadratic regression constants */
+    final var a1 = 0.0010007;
+    final var b1 = 0.101502;
+    final var c1 = 7.85883;
+    final var a2 = -0.0010289;
+    final var b2 = 0.229311;
+    final var c2 = 6.26015;
+
+    /* Quadratic regression function */
+    DoubleUnaryOperator estimateZCoM = h -> h < 0 ? 7.885
+        : h < 45 ? a1 * h * h + b1 * h + c1 : h < 75 ? a2 * h * h + b2 * h + c2 : 17.731;
+
+    // CoM Z in inches
+    var zCoM = Inches.of(estimateZCoM.applyAsDouble(elevator.getExtension()));
+
+    // 3D robot pose from 2D robot pose
+    var robotPose3d = new Pose3d(driveSimulation.getSimulatedDriveTrainPose());
+
+    //
+    var localRobotCoM = new Translation3d(Inches.of(-1.793095), Inches.of(0.824046), zCoM);
+
+    // TODO +/- choose by direction
+    var pitchPivot = new Translation3d(Inches.of(10.375), Inches.zero(), Inches.zero());
+
+    if (pitch > 0 && pitch < Math.PI) {
+      pitchPivot = pitchPivot.times(-1);
+    }
+
+    var toPitchPivot = new Transform3d(pitchPivot.times(-1), Rotation3d.kZero);
+    var pitchRotation = new Transform3d(Translation3d.kZero, new Rotation3d(0, pitch, 0));
+    var fromPitchPivot = new Transform3d(pitchPivot, Rotation3d.kZero);
+
+    var worldRobotPose3d = robotPose3d.transformBy(toPitchPivot)
+        .transformBy(pitchRotation).transformBy(fromPitchPivot);
+    Logger.recordOutput("RobotPose3d", worldRobotPose3d);
+
+    var worldRobotCoM = worldRobotPose3d
+        .plus(new Transform3d(localRobotCoM, Rotation3d.kZero));
+    Logger.recordOutput("RobotCoM", worldRobotCoM);
+
+    final var M = DriveConstants.ROBOT_MASS_KG;
+    final var G = MetersPerSecondPerSecond.of(9.81);
+    final var PITCH_MOI = 5.042; // I_yy; kg m^2
+
+    var externalTorque = M * -acceleration.x * zCoM.in(Meters);
+    var pivotToCoMX = worldRobotCoM.relativeTo(robotPose3d.plus(toPitchPivot)).getMeasureX();
+    Logger.recordOutput("PivotToCoMX", pivotToCoMX);
+
+    final var EQUILIBRIUM_THRESHOLD = Degrees.of(6).in(Radians) / 2;
+    final var EFFECTIVE_PIVOT_SIGMOID_STEEPNESS = 5.0;
+
+    var absPitch = pitch > Math.PI ? 2 * Math.PI - pitch : pitch;
+    var effectivePivotSigmoidScalar = 1
+        / (1 + Math.exp(-EFFECTIVE_PIVOT_SIGMOID_STEEPNESS * (absPitch / EQUILIBRIUM_THRESHOLD - 1)));
+    var effectivePivotToCoMX = effectivePivotSigmoidScalar * pivotToCoMX.in(Meters);
+
+    Logger.recordOutput("EffectivePivotToCoMX", effectivePivotToCoMX);
+
+    final var PITCH_VELOCITY_DAMPING = 0;
+
+    var gravityTorque = M * G.in(MetersPerSecondPerSecond) * effectivePivotToCoMX;
+    var dampingTorque = -pitchVelocity * PITCH_VELOCITY_DAMPING;
+    var pitchTorque = gravityTorque + externalTorque + dampingTorque;
     var pitchAccel = pitchTorque / PITCH_MOI;
+
+    Logger.recordOutput("GravityTorque", gravityTorque);
+    Logger.recordOutput("ExternalTorque", externalTorque);
 
     pitchVelocity += pitchAccel * 0.02;
     pitch += pitchVelocity * 0.02;
+    pitch = pitch % (2 * Math.PI);
 
-    // TODO integrate how gravity affects pitch and roll for restorative effects
+    if (pitch < 0)
+      pitch = pitch + 2 * Math.PI;
+
+    if (pitchVelocity > 0 && pitch > 0.5 * Math.PI && pitch < Math.PI) {
+      pitch = 0.5 * Math.PI;
+      pitchVelocity = 0;
+    } else if (pitchVelocity < 0 && pitch < 1.5 * Math.PI && pitch > Math.PI) {
+      pitch = 1.5 * Math.PI;
+      pitchVelocity = 0;
+    }
+
+    final var GROUND_CONTACT_THRESHOLD = Degrees.of(7).in(Radians) / 2;
+    final var GROUND_CONTACT_ENERGY_LOSS_SCALAR = 0.3;
+    final var GROUND_CONTACT_SIGMOID_STEEPNESS = 8.0;
+    var groundContactSigmoidScalar = 1
+        / (1 + Math.exp(-GROUND_CONTACT_SIGMOID_STEEPNESS * (absPitch / GROUND_CONTACT_THRESHOLD - 1)));
+
+    pitchVelocity *= groundContactSigmoidScalar * (1.0 -
+        GROUND_CONTACT_ENERGY_LOSS_SCALAR)
+        + GROUND_CONTACT_ENERGY_LOSS_SCALAR;
 
     Logger.recordOutput("PitchAcceleration", pitchAccel);
     Logger.recordOutput("PitchVelocity", pitchVelocity);
